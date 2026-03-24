@@ -1,0 +1,101 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# 🔹 Branch genérico (serve tanto para ultrassom quanto bioimpedância)
+class Branch(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+
+        # Bloco convolucional: extrai padrões espaciais dos mapas
+        self.conv = nn.Sequential(
+
+            # 1ª camada convolucional
+            # Entrada: in_channels (ex: 2 canais → pressure + power)
+            # Saída: 16 mapas de características
+            nn.Conv2d(in_channels, 16, 3, padding=1),
+
+            # Função de ativação (introduz não-linearidade)
+            nn.ReLU(),
+
+            # Reduz pela metade H e W (downsampling)
+            nn.MaxPool2d(2),
+
+            # 2ª camada convolucional
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            # 3ª camada convolucional
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+
+            # Reduz tudo para tamanho fixo (4x4), independente do input
+            # Isso evita problema de dimensão variável
+            nn.AdaptiveAvgPool2d((4,4))
+        )
+
+        # Camada totalmente conectada (transforma mapa em vetor)
+        self.fc = nn.Linear(64*4*4, 128)
+
+    def forward(self, x):
+        # x entra como imagem: [batch, canais, altura, largura]
+
+        x = self.conv(x)
+        # Agora x tem shape: [batch, 64, 4, 4]
+
+        # Achata (flatten): transforma em vetor
+        x = x.view(x.size(0), -1)
+        # Agora: [batch, 64*4*4 = 1024]
+
+        # Reduz para 128 features (representação compacta)
+        return F.relu(self.fc(x))
+
+
+# 🔹 Modelo multimodal (ultrassom + bioimpedância)
+class CancerModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # Branch para ultrassom
+        # Entrada: 2 canais → pressure e power
+        self.ultra_branch = Branch(in_channels=2)
+
+        # Branch para bioimpedância
+        # Entrada: 2 canais → E e J
+        self.bio_branch   = Branch(in_channels=2)
+
+        # Camadas finais (fusão das informações)
+        self.fc = nn.Sequential(
+
+            # Junta os dois vetores (128 + 128 = 256)
+            nn.Linear(256, 64),
+
+            nn.ReLU(),
+
+            # Saída final (1 valor)
+            nn.Linear(64, 1),
+
+            # Sigmoid transforma em probabilidade (0 a 1)
+            nn.Sigmoid()
+        )
+
+    def forward(self, ultra, bio):
+        # ultra: [batch, 2, H, W]
+        # bio:   [batch, 2, H, W]
+
+        # Extrai features do ultrassom
+        f1 = self.ultra_branch(ultra)
+        # f1: [batch, 128]
+
+        # Extrai features da bioimpedância
+        f2 = self.bio_branch(bio)
+        # f2: [batch, 128]
+
+        # Junta (concatena) as duas representações
+        x = torch.cat((f1, f2), dim=1)
+        # x: [batch, 256]
+
+        # Passa pelas camadas finais
+        return self.fc(x)
+        # saída: [batch, 1] → probabilidade de câncer
