@@ -1,0 +1,360 @@
+# ============================================================
+# ULTRASSOM — AQUISIÇÃO DE SINAL RF PARA CNN MULTIMODAL
+# ============================================================
+#
+# Inspirado na arquitetura do echomods
+# Adaptado para:
+#
+#   - detecção de alterações neoplásicas
+#   - aprendizado por IA
+#   - foco em SINAL RF
+#   - NÃO em formação de imagem
+#
+# ============================================================
+#
+# PIPELINE:
+#
+# Pulso ultrassônico
+#        ↓
+# Propagação no tecido
+#        ↓
+# Reflexões / ecos
+#        ↓
+# Aquisição RF
+#        ↓
+# Pré-processamento
+#        ↓
+# Extração de features
+#        ↓
+# Vetor para CNN
+#
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from scipy.signal import hilbert
+from scipy.signal import butter, filtfilt
+from scipy.fft import fft
+
+# ============================================================
+# CONFIGURAÇÕES GERAIS
+# ============================================================
+
+# Frequência de amostragem ADC
+FS = 40e6                 # 40 MHz
+
+# Frequência central do transdutor
+F0 = 5e6                  # 5 MHz
+
+# Velocidade do som
+C = 1540                  # m/s
+
+# Duração do sinal
+DURATION = 150e-6         # 150 us
+
+# ============================================================
+# EIXO TEMPORAL
+# ============================================================
+
+t = np.arange(0, DURATION, 1/FS)
+
+# ============================================================
+# PULSO ULTRASSÔNICO
+# ============================================================
+
+def gaussian_pulse():
+
+    """
+    Gera pulso ultrassônico.
+    """
+
+    sigma = 0.3e-6
+
+    pulse = np.sin(
+        2*np.pi*F0*t
+    ) * np.exp(
+        -((t-3e-6)**2)/(2*sigma**2)
+    )
+
+    return pulse
+
+# ============================================================
+# SIMULAÇÃO DO TECIDO
+# ============================================================
+
+def tissue_echo(tumor=False):
+
+    """
+    Simula ecos ultrassônicos.
+    """
+
+    signal = np.zeros_like(t)
+
+    # --------------------------------------------------------
+    # ECO NORMAL DO TECIDO
+    # --------------------------------------------------------
+
+    depth1 = 0.03
+
+    tof1 = 2 * depth1 / C
+
+    idx1 = int(tof1 * FS)
+
+    pulse = gaussian_pulse()
+
+    signal[idx1:idx1+len(pulse)] += 0.4 * pulse[:len(signal)-idx1]
+
+    # --------------------------------------------------------
+    # TUMOR
+    # --------------------------------------------------------
+
+    if tumor:
+
+        depth2 = 0.05
+
+        tof2 = 2 * depth2 / C
+
+        idx2 = int(tof2 * FS)
+
+        # Tumor gera reflexão mais intensa
+        # devido ao contraste acústico
+
+        signal[idx2:idx2+len(pulse)] += (
+            1.2 * pulse[:len(signal)-idx2]
+        )
+
+    # --------------------------------------------------------
+    # RUÍDO ELETRÔNICO
+    # --------------------------------------------------------
+
+    noise = np.random.normal(
+        0,
+        0.02,
+        len(signal)
+    )
+
+    return signal + noise
+
+# ============================================================
+# FILTRO PASSA-BANDA
+# ============================================================
+
+def bandpass(signal):
+
+    """
+    Filtra banda do transdutor.
+    """
+
+    low = 3e6
+    high = 7e6
+
+    nyquist = FS / 2
+
+    b, a = butter(
+        4,
+        [low/nyquist, high/nyquist],
+        btype='band'
+    )
+
+    return filtfilt(b, a, signal)
+
+# ============================================================
+# DEMODULAÇÃO POR HILBERT
+# ============================================================
+
+def envelope(signal):
+
+    """
+    Extrai envelope RF.
+    """
+
+    analytic = hilbert(signal)
+
+    env = np.abs(analytic)
+
+    return env
+
+# ============================================================
+# EXTRAÇÃO DE FEATURES
+# ============================================================
+
+def extract_features(signal):
+
+    """
+    Features para IA.
+    """
+
+    # --------------------------------------------------------
+    # FFT
+    # --------------------------------------------------------
+
+    spectrum = fft(signal)
+
+    magnitude = np.abs(spectrum)
+
+    # --------------------------------------------------------
+    # ENVELOPE
+    # --------------------------------------------------------
+
+    env = envelope(signal)
+
+    # --------------------------------------------------------
+    # FEATURES
+    # --------------------------------------------------------
+
+    features = {
+
+        "rf_mean": np.mean(signal),
+
+        "rf_std": np.std(signal),
+
+        "rf_energy": np.sum(signal**2),
+
+        "max_echo": np.max(env),
+
+        "mean_envelope": np.mean(env),
+
+        "spectral_mean": np.mean(magnitude),
+
+        "spectral_max": np.max(magnitude)
+
+    }
+
+    return features
+
+# ============================================================
+# DATASET
+# ============================================================
+
+dataset = []
+
+labels = []
+
+# ------------------------------------------------------------
+# GERA AMOSTRAS
+# ------------------------------------------------------------
+
+for tumor in [False, True]:
+
+    for sample in range(100):
+
+        # ----------------------------------------------------
+        # GERA RF
+        # ----------------------------------------------------
+
+        raw_signal = tissue_echo(
+            tumor=tumor
+        )
+
+        # ----------------------------------------------------
+        # FILTRA
+        # ----------------------------------------------------
+
+        filtered = bandpass(raw_signal)
+
+        # ----------------------------------------------------
+        # FEATURES
+        # ----------------------------------------------------
+
+        features = extract_features(
+            filtered
+        )
+
+        vector = [
+
+            features["rf_mean"],
+            features["rf_std"],
+            features["rf_energy"],
+            features["max_echo"],
+            features["mean_envelope"],
+            features["spectral_mean"],
+            features["spectral_max"]
+
+        ]
+
+        dataset.append(vector)
+
+        labels.append(
+            int(tumor)
+        )
+
+# ============================================================
+# CONVERSÃO
+# ============================================================
+
+X_ultra = np.array(dataset)
+
+y_ultra = np.array(labels)
+
+# ============================================================
+# EXEMPLO DE RF
+# ============================================================
+
+example = tissue_echo(
+    tumor=True
+)
+
+example = bandpass(example)
+
+env = envelope(example)
+
+# ============================================================
+# VISUALIZAÇÃO
+# ============================================================
+
+plt.figure(figsize=(14,5))
+
+plt.plot(
+    t*1e6,
+    example,
+    label="RF Signal"
+)
+
+plt.plot(
+    t*1e6,
+    env,
+    linewidth=2,
+    label="Envelope"
+)
+
+plt.xlabel("Tempo (us)")
+plt.ylabel("Amplitude")
+
+plt.title("Sinal RF Ultrassônico")
+
+plt.legend()
+
+plt.grid()
+
+plt.show()
+
+# ============================================================
+# INFORMAÇÕES
+# ============================================================
+
+print("===================================")
+print("DATASET ULTRASSOM")
+print("===================================")
+
+print("Shape X:", X_ultra.shape)
+print("Shape y:", y_ultra.shape)
+
+print("\nExemplo vetor:")
+print(X_ultra[0])
+
+# ============================================================
+# SALVAR
+# ============================================================
+
+np.save(
+    "ultrasound_X.npy",
+    X_ultra
+)
+
+np.save(
+    "ultrasound_y.npy",
+    y_ultra
+)
+
+print("\nDataset salvo.")
