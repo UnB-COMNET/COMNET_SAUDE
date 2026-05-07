@@ -1,0 +1,271 @@
+# ============================================================
+# BIOIMPEDÂNCIA — AQUISIÇÃO DE SINAL PARA IA
+# ============================================================
+#
+# Objetivo:
+# Capturar sinais elétricos de bioimpedância
+# e preparar os dados para a CNN multimodal.
+#
+# O sistema:
+# 1. Injeta corrente AC no tecido
+# 2. Mede tensão resultante
+# 3. Calcula impedância:
+#
+#       Z = V / I
+#
+# 4. Extrai:
+#       - magnitude
+#       - fase
+#       - espectro
+#
+# 5. Salva vetor para IA
+#
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.fft import fft
+from scipy.signal import butter, filtfilt
+
+# ============================================================
+# CONFIGURAÇÕES DO SISTEMA
+# ============================================================
+
+# Frequência de amostragem
+FS = 10_000_000      # 10 MHz
+
+# Duração da aquisição
+DURATION = 0.002     # 2 ms
+
+# Frequências da bioimpedância
+FREQS = [1e6, 2e6, 5e6]
+
+# Corrente injetada
+CURRENT = 1e-3       # 1 mA
+
+# ============================================================
+# EIXO TEMPORAL
+# ============================================================
+
+t = np.arange(0, DURATION, 1/FS)
+
+# ============================================================
+# SIMULAÇÃO DE TECIDO
+# ============================================================
+
+def tissue_response(freq, tumor=False):
+
+    """
+    Simula resposta elétrica do tecido.
+    """
+
+    # --------------------------------------------------------
+    # TECIDO SAUDÁVEL
+    # --------------------------------------------------------
+
+    if not tumor:
+
+        resistance = 120
+        phase_shift = 0.15
+
+    # --------------------------------------------------------
+    # TECIDO NEOPLÁSICO
+    # --------------------------------------------------------
+
+    else:
+
+        resistance = 180
+        phase_shift = 0.45
+
+    # --------------------------------------------------------
+    # SINAL DE TENSÃO
+    # --------------------------------------------------------
+
+    voltage = resistance * CURRENT * np.sin(
+        2*np.pi*freq*t + phase_shift
+    )
+
+    # Ruído
+    noise = np.random.normal(0, 0.002, len(t))
+
+    return voltage + noise
+
+# ============================================================
+# FILTRO PASSA-BAIXA
+# ============================================================
+
+def lowpass(signal, cutoff=2e6):
+
+    nyquist = FS / 2
+
+    b, a = butter(
+        4,
+        cutoff / nyquist,
+        btype='low'
+    )
+
+    return filtfilt(b, a, signal)
+
+# ============================================================
+# EXTRAÇÃO DE FEATURES
+# ============================================================
+
+def extract_features(signal):
+
+    """
+    Extrai:
+    - magnitude
+    - fase
+    - espectro
+    """
+
+    # --------------------------------------------------------
+    # FFT
+    # --------------------------------------------------------
+
+    spectrum = fft(signal)
+
+    magnitude = np.abs(spectrum)
+
+    phase = np.angle(spectrum)
+
+    # --------------------------------------------------------
+    # FEATURES RESUMIDAS
+    # --------------------------------------------------------
+
+    features = {
+
+        "mean_magnitude": np.mean(magnitude),
+
+        "max_magnitude": np.max(magnitude),
+
+        "mean_phase": np.mean(phase),
+
+        "std_phase": np.std(phase),
+
+        "signal_energy": np.sum(signal**2)
+
+    }
+
+    return features, magnitude, phase
+
+# ============================================================
+# AQUISIÇÃO MULTIFREQUÊNCIA
+# ============================================================
+
+dataset = []
+
+labels = []
+
+for tumor in [False, True]:
+
+    # --------------------------------------------------------
+    # GERA VÁRIAS AMOSTRAS
+    # --------------------------------------------------------
+
+    for sample in range(50):
+
+        all_features = []
+
+        for freq in FREQS:
+
+            # -----------------------------------------------
+            # SINAL BRUTO
+            # -----------------------------------------------
+
+            raw_signal = tissue_response(
+                freq,
+                tumor=tumor
+            )
+
+            # -----------------------------------------------
+            # FILTRAGEM
+            # -----------------------------------------------
+
+            filtered_signal = lowpass(raw_signal)
+
+            # -----------------------------------------------
+            # EXTRAÇÃO
+            # -----------------------------------------------
+
+            features, mag, phase = extract_features(
+                filtered_signal
+            )
+
+            # -----------------------------------------------
+            # CONCATENA FEATURES
+            # -----------------------------------------------
+
+            all_features.extend([
+                features["mean_magnitude"],
+                features["max_magnitude"],
+                features["mean_phase"],
+                features["std_phase"],
+                features["signal_energy"]
+            ])
+
+        dataset.append(all_features)
+
+        # -----------------------------------------------
+        # LABEL
+        # 0 = saudável
+        # 1 = tumor
+        # -----------------------------------------------
+
+        labels.append(int(tumor))
+
+# ============================================================
+# CONVERTE PARA NUMPY
+# ============================================================
+
+X = np.array(dataset)
+
+y = np.array(labels)
+
+# ============================================================
+# VISUALIZAÇÃO
+# ============================================================
+
+print("===================================")
+print("DATASET GERADO")
+print("===================================")
+
+print("Shape X:", X.shape)
+print("Shape y:", y.shape)
+
+print("\nExemplo de feature vector:")
+print(X[0])
+
+# ============================================================
+# PLOT EXEMPLO
+# ============================================================
+
+example_signal = tissue_response(
+    freq=1e6,
+    tumor=True
+)
+
+plt.figure(figsize=(12,4))
+
+plt.plot(
+    t[:3000],
+    example_signal[:3000]
+)
+
+plt.title("Sinal de Bioimpedância")
+plt.xlabel("Tempo")
+plt.ylabel("Amplitude")
+
+plt.grid()
+
+plt.show()
+
+# ============================================================
+# SALVAR DATASET
+# ============================================================
+
+np.save("bioimpedance_X.npy", X)
+
+np.save("bioimpedance_y.npy", y)
+
+print("\nDataset salvo com sucesso.")
