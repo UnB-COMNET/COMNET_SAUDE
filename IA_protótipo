@@ -1,101 +1,605 @@
+# ============================================================
+# CNN MULTIMODAL — ULTRASSOM + BIOIMPEDÂNCIA
+# ============================================================
+#
+# OBJETIVO:
+# Detectar alterações neoplásicas utilizando:
+#
+#   • sinais RF ultrassônicos
+#   • sinais complexos de bioimpedância
+#
+# A CNN aprende diretamente dos sinais físicos.
+#
+# ============================================================
+#
+# ARQUITETURA:
+#
+# ULTRASSOM  ──► CNN 1D ─┐
+#                         ├──► CONCATENAÇÃO ─► CLASSIFICAÇÃO
+# BIOIMPEDÂNCIA ─► CNN 1D┘
+#
+# ============================================================
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 🔹 Branch genérico (serve tanto para ultrassom quanto bioimpedância)
-class Branch(nn.Module):
-    def __init__(self, in_channels):
+# ============================================================
+# BLOCO RESIDUAL 1D
+# ============================================================
+#
+# Bloco inspirado em ResNet.
+#
+# Vantagens:
+#
+# • melhora fluxo de gradiente
+# • evita vanishing gradient
+# • permite redes mais profundas
+# • melhora estabilidade
+#
+# ============================================================
+
+class ResidualBlock1D(nn.Module):
+
+    def __init__(self, in_channels, out_channels):
+
         super().__init__()
 
-        # Bloco convolucional: extrai padrões espaciais dos mapas
-        self.conv = nn.Sequential(
+        # ----------------------------------------------------
+        # CAMINHO PRINCIPAL
+        # ----------------------------------------------------
 
-            # 1ª camada convolucional
-            # Entrada: in_channels (ex: 2 canais → pressure + power)
-            # Saída: 16 mapas de características
-            nn.Conv2d(in_channels, 16, 3, padding=1),
-
-            # Função de ativação (introduz não-linearidade)
-            nn.ReLU(),
-
-            # Reduz pela metade H e W (downsampling)
-            nn.MaxPool2d(2),
-
-            # 2ª camada convolucional
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            # 3ª camada convolucional
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-
-            # Reduz tudo para tamanho fixo (4x4), independente do input
-            # Isso evita problema de dimensão variável
-            nn.AdaptiveAvgPool2d((4,4))
+        self.conv1 = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1
         )
 
-        # Camada totalmente conectada (transforma mapa em vetor)
-        self.fc = nn.Linear(64*4*4, 128)
+        self.bn1 = nn.BatchNorm1d(
+            out_channels
+        )
+
+        self.conv2 = nn.Conv1d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1
+        )
+
+        self.bn2 = nn.BatchNorm1d(
+            out_channels
+        )
+
+        # ----------------------------------------------------
+        # AJUSTE DIMENSIONAL
+        # ----------------------------------------------------
+        #
+        # Se número de canais mudar,
+        # ajustamos via convolução 1x1.
+        #
+        # Exemplo:
+        #
+        # 16 canais -> 32 canais
+        #
+        # ----------------------------------------------------
+
+        self.shortcut = nn.Sequential()
+
+        if in_channels != out_channels:
+
+            self.shortcut = nn.Sequential(
+
+                nn.Conv1d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1
+                ),
+
+                nn.BatchNorm1d(
+                    out_channels
+                )
+            )
 
     def forward(self, x):
-        # x entra como imagem: [batch, canais, altura, largura]
 
-        x = self.conv(x)
-        # Agora x tem shape: [batch, 64, 4, 4]
+        # ----------------------------------------------------
+        # GUARDA ENTRADA ORIGINAL
+        # ----------------------------------------------------
 
-        # Achata (flatten): transforma em vetor
-        x = x.view(x.size(0), -1)
-        # Agora: [batch, 64*4*4 = 1024]
+        residual = x
 
-        # Reduz para 128 features (representação compacta)
-        return F.relu(self.fc(x))
+        # ----------------------------------------------------
+        # CONVOLUÇÃO 1
+        # ----------------------------------------------------
+
+        x = self.conv1(x)
+
+        x = self.bn1(x)
+
+        x = F.relu(x)
+
+        # ----------------------------------------------------
+        # CONVOLUÇÃO 2
+        # ----------------------------------------------------
+
+        x = self.conv2(x)
+
+        x = self.bn2(x)
+
+        # ----------------------------------------------------
+        # SOMA RESIDUAL
+        # ----------------------------------------------------
+
+        x += self.shortcut(residual)
+
+        # ----------------------------------------------------
+        # NÃO-LINEARIDADE FINAL
+        # ----------------------------------------------------
+
+        x = F.relu(x)
+
+        return x
 
 
-# 🔹 Modelo multimodal (ultrassom + bioimpedância)
-class CancerModel(nn.Module):
+# ============================================================
+# BRANCH DE ULTRASSOM
+# ============================================================
+#
+# Entrada esperada:
+#
+# [batch, canais, tempo]
+#
+# Canais:
+#
+# 0 -> RF bruto
+# 1 -> envelope
+# 2 -> espectro FFT
+# 3 -> derivada temporal
+#
+# ============================================================
+
+class UltrasoundBranch(nn.Module):
+
     def __init__(self):
+
         super().__init__()
 
-        # Branch para ultrassom
-        # Entrada: 2 canais → pressure e power
-        self.ultra_branch = Branch(in_channels=2)
+        # ----------------------------------------------------
+        # EXTRAÇÃO DE FEATURES
+        # ----------------------------------------------------
 
-        # Branch para bioimpedância
-        # Entrada: 2 canais → E e J
-        self.bio_branch   = Branch(in_channels=2)
+        self.features = nn.Sequential(
 
-        # Camadas finais (fusão das informações)
+            # ----------------------------------------------
+            # BLOCO 1
+            # ----------------------------------------------
+
+            ResidualBlock1D(
+                in_channels=4,
+                out_channels=32
+            ),
+
+            nn.MaxPool1d(2),
+
+            nn.Dropout(0.1),
+
+            # ----------------------------------------------
+            # BLOCO 2
+            # ----------------------------------------------
+
+            ResidualBlock1D(
+                32,
+                64
+            ),
+
+            nn.MaxPool1d(2),
+
+            nn.Dropout(0.15),
+
+            # ----------------------------------------------
+            # BLOCO 3
+            # ----------------------------------------------
+
+            ResidualBlock1D(
+                64,
+                128
+            ),
+
+            nn.MaxPool1d(2),
+
+            nn.Dropout(0.2)
+        )
+
+        # ----------------------------------------------------
+        # GLOBAL POOLING
+        # ----------------------------------------------------
+        #
+        # Reduz dimensão temporal
+        # sem perder informação estatística.
+        #
+        # ----------------------------------------------------
+
+        self.pool = nn.AdaptiveAvgPool1d(1)
+
+        # ----------------------------------------------------
+        # EMBEDDING FINAL
+        # ----------------------------------------------------
+
         self.fc = nn.Sequential(
 
-            # Junta os dois vetores (128 + 128 = 256)
-            nn.Linear(256, 64),
+            nn.Linear(
+                128,
+                128
+            ),
 
             nn.ReLU(),
 
-            # Saída final (1 valor)
-            nn.Linear(64, 1),
+            nn.Dropout(0.3)
+        )
 
-            # Sigmoid transforma em probabilidade (0 a 1)
+    def forward(self, x):
+
+        # x:
+        # [batch, 4, tempo]
+
+        x = self.features(x)
+
+        # Agora:
+        # [batch, 128, T]
+
+        x = self.pool(x)
+
+        # Agora:
+        # [batch, 128, 1]
+
+        x = x.squeeze(-1)
+
+        # Agora:
+        # [batch, 128]
+
+        x = self.fc(x)
+
+        return x
+
+
+# ============================================================
+# BRANCH DE BIOIMPEDÂNCIA
+# ============================================================
+#
+# Entrada:
+#
+# [batch, canais, frequências]
+#
+# Canais:
+#
+# 0 -> Re(Z)
+# 1 -> Im(Z)
+# 2 -> |Z|
+# 3 -> fase(Z)
+#
+# ============================================================
+
+class BioimpedanceBranch(nn.Module):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.features = nn.Sequential(
+
+            ResidualBlock1D(
+                4,
+                32
+            ),
+
+            nn.MaxPool1d(2),
+
+            nn.Dropout(0.1),
+
+            ResidualBlock1D(
+                32,
+                64
+            ),
+
+            nn.MaxPool1d(2),
+
+            nn.Dropout(0.15),
+
+            ResidualBlock1D(
+                64,
+                128
+            ),
+
+            nn.MaxPool1d(2),
+
+            nn.Dropout(0.2)
+        )
+
+        self.pool = nn.AdaptiveAvgPool1d(1)
+
+        self.fc = nn.Sequential(
+
+            nn.Linear(
+                128,
+                128
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(0.3)
+        )
+
+    def forward(self, x):
+
+        x = self.features(x)
+
+        x = self.pool(x)
+
+        x = x.squeeze(-1)
+
+        x = self.fc(x)
+
+        return x
+
+
+# ============================================================
+# CNN MULTIMODAL
+# ============================================================
+#
+# FUSÃO:
+#
+# Features ultrassom
+#           +
+# Features bioimpedância
+#
+# ============================================================
+
+class CancerMultimodalCNN(nn.Module):
+
+    def __init__(self):
+
+        super().__init__()
+
+        # ----------------------------------------------------
+        # BRANCHES
+        # ----------------------------------------------------
+
+        self.ultra_branch = UltrasoundBranch()
+
+        self.bio_branch = BioimpedanceBranch()
+
+        # ----------------------------------------------------
+        # CLASSIFICADOR FINAL
+        # ----------------------------------------------------
+
+        self.classifier = nn.Sequential(
+
+            # ----------------------------------------------
+            # CONCATENAÇÃO:
+            #
+            # 128 + 128 = 256
+            # ----------------------------------------------
+
+            nn.Linear(
+                256,
+                128
+            ),
+
+            nn.BatchNorm1d(
+                128
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(0.4),
+
+            # ----------------------------------------------
+            # CAMADA INTERMEDIÁRIA
+            # ----------------------------------------------
+
+            nn.Linear(
+                128,
+                64
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(0.3),
+
+            # ----------------------------------------------
+            # SAÍDA
+            # ----------------------------------------------
+            #
+            # 1 neurônio:
+            #
+            # probabilidade de câncer
+            #
+            # 0 -> saudável
+            # 1 -> neoplásico
+            #
+            # ----------------------------------------------
+
+            nn.Linear(
+                64,
+                1
+            ),
+
             nn.Sigmoid()
         )
 
     def forward(self, ultra, bio):
-        # ultra: [batch, 2, H, W]
-        # bio:   [batch, 2, H, W]
 
-        # Extrai features do ultrassom
-        f1 = self.ultra_branch(ultra)
-        # f1: [batch, 128]
+        # ----------------------------------------------------
+        # EXTRAI FEATURES
+        # ----------------------------------------------------
 
-        # Extrai features da bioimpedância
-        f2 = self.bio_branch(bio)
-        # f2: [batch, 128]
+        ultra_features = self.ultra_branch(
+            ultra
+        )
 
-        # Junta (concatena) as duas representações
-        x = torch.cat((f1, f2), dim=1)
-        # x: [batch, 256]
+        bio_features = self.bio_branch(
+            bio
+        )
 
-        # Passa pelas camadas finais
-        return self.fc(x)
-        # saída: [batch, 1] → probabilidade de câncer
+        # ----------------------------------------------------
+        # CONCATENAÇÃO MULTIMODAL
+        # ----------------------------------------------------
+
+        x = torch.cat(
+
+            (
+                ultra_features,
+                bio_features
+            ),
+
+            dim=1
+        )
+
+        # ----------------------------------------------------
+        # CLASSIFICAÇÃO FINAL
+        # ----------------------------------------------------
+
+        output = self.classifier(x)
+
+        return output
+
+
+# ============================================================
+# INSTÂNCIA DO MODELO
+# ============================================================
+
+model = CancerMultimodalCNN()
+
+# ============================================================
+# LOSS FUNCTION
+# ============================================================
+#
+# Binary Cross Entropy:
+#
+# adequada para:
+#
+# • câncer vs saudável
+#
+# ============================================================
+
+criterion = nn.BCELoss()
+
+# ============================================================
+# OTIMIZADOR
+# ============================================================
+#
+# Adam:
+#
+# • convergência rápida
+# • estabilidade
+# • muito usado em IA biomédica
+#
+# ============================================================
+
+optimizer = torch.optim.Adam(
+
+    model.parameters(),
+
+    lr=1e-4,
+
+    weight_decay=1e-5
+)
+
+# ============================================================
+# EXEMPLO DE ENTRADA
+# ============================================================
+
+batch_size = 8
+
+# ------------------------------------------------------------
+# ULTRASSOM
+# ------------------------------------------------------------
+#
+# [batch, canais, tempo]
+#
+# 4 canais:
+#
+# • RF
+# • envelope
+# • FFT
+# • derivada temporal
+#
+# ------------------------------------------------------------
+
+ultra_input = torch.randn(
+    batch_size,
+    4,
+    4096
+)
+
+# ------------------------------------------------------------
+# BIOIMPEDÂNCIA
+# ------------------------------------------------------------
+#
+# [batch, canais, frequências]
+#
+# 4 canais:
+#
+# • Re(Z)
+# • Im(Z)
+# • |Z|
+# • fase
+#
+# ------------------------------------------------------------
+
+bio_input = torch.randn(
+    batch_size,
+    4,
+    256
+)
+
+# ============================================================
+# FORWARD PASS
+# ============================================================
+
+output = model(
+    ultra_input,
+    bio_input
+)
+
+# ============================================================
+# RESULTADO
+# ============================================================
+
+print("===================================")
+print("SAÍDA DA CNN")
+print("===================================")
+
+print(output.shape)
+
+print(output)
+
+# ============================================================
+# LOSS EXEMPLO
+# ============================================================
+
+target = torch.randint(
+    0,
+    2,
+    (batch_size, 1)
+).float()
+
+loss = criterion(
+    output,
+    target
+)
+
+print("\nLoss:", loss.item())
+
+# ============================================================
+# BACKPROPAGATION
+# ============================================================
+
+optimizer.zero_grad()
+
+loss.backward()
+
+optimizer.step()
+
+print("\nBackpropagation executada.")
