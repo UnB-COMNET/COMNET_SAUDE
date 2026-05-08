@@ -1,605 +1,588 @@
 # ============================================================
-# CNN MULTIMODAL — ULTRASSOM + BIOIMPEDÂNCIA
+# BIOIMPEDÂNCIA MULTIFREQUENCIAL PARA CNN MULTIMODAL
 # ============================================================
 #
 # OBJETIVO:
-# Detectar alterações neoplásicas utilizando:
 #
-#   • sinais RF ultrassônicos
-#   • sinais complexos de bioimpedância
+# Simular aquisição REALISTA de bioimpedância
+# para detecção de alterações neoplásicas.
 #
-# A CNN aprende diretamente dos sinais físicos.
+# O sistema gera:
+#
+#   • impedância complexa
+#   • magnitude
+#   • fase
+#   • Re(Z)
+#   • Im(Z)
+#
+# usando modelo Cole-Cole biomédico.
 #
 # ============================================================
 #
-# ARQUITETURA:
+# DIFERENÇAS EM RELAÇÃO AO MODELO ANTIGO:
 #
-# ULTRASSOM  ──► CNN 1D ─┐
-#                         ├──► CONCATENAÇÃO ─► CLASSIFICAÇÃO
-# BIOIMPEDÂNCIA ─► CNN 1D┘
-#
-# ============================================================
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# ============================================================
-# BLOCO RESIDUAL 1D
-# ============================================================
-#
-# Bloco inspirado em ResNet.
-#
-# Vantagens:
-#
-# • melhora fluxo de gradiente
-# • evita vanishing gradient
-# • permite redes mais profundas
-# • melhora estabilidade
+# ✔ modelo Cole-Cole real
+# ✔ domínio complexo
+# ✔ dispersão dielétrica
+# ✔ multifrequencial denso
+# ✔ ruído eletrônico realista
+# ✔ drift instrumental
+# ✔ variação biológica
+# ✔ normalização robusta
+# ✔ sinais completos para CNN
 #
 # ============================================================
 
-class ResidualBlock1D(nn.Module):
+import numpy as np
+import matplotlib.pyplot as plt
 
-    def __init__(self, in_channels, out_channels):
-
-        super().__init__()
-
-        # ----------------------------------------------------
-        # CAMINHO PRINCIPAL
-        # ----------------------------------------------------
-
-        self.conv1 = nn.Conv1d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            padding=1
-        )
-
-        self.bn1 = nn.BatchNorm1d(
-            out_channels
-        )
-
-        self.conv2 = nn.Conv1d(
-            out_channels,
-            out_channels,
-            kernel_size=3,
-            padding=1
-        )
-
-        self.bn2 = nn.BatchNorm1d(
-            out_channels
-        )
-
-        # ----------------------------------------------------
-        # AJUSTE DIMENSIONAL
-        # ----------------------------------------------------
-        #
-        # Se número de canais mudar,
-        # ajustamos via convolução 1x1.
-        #
-        # Exemplo:
-        #
-        # 16 canais -> 32 canais
-        #
-        # ----------------------------------------------------
-
-        self.shortcut = nn.Sequential()
-
-        if in_channels != out_channels:
-
-            self.shortcut = nn.Sequential(
-
-                nn.Conv1d(
-                    in_channels,
-                    out_channels,
-                    kernel_size=1
-                ),
-
-                nn.BatchNorm1d(
-                    out_channels
-                )
-            )
-
-    def forward(self, x):
-
-        # ----------------------------------------------------
-        # GUARDA ENTRADA ORIGINAL
-        # ----------------------------------------------------
-
-        residual = x
-
-        # ----------------------------------------------------
-        # CONVOLUÇÃO 1
-        # ----------------------------------------------------
-
-        x = self.conv1(x)
-
-        x = self.bn1(x)
-
-        x = F.relu(x)
-
-        # ----------------------------------------------------
-        # CONVOLUÇÃO 2
-        # ----------------------------------------------------
-
-        x = self.conv2(x)
-
-        x = self.bn2(x)
-
-        # ----------------------------------------------------
-        # SOMA RESIDUAL
-        # ----------------------------------------------------
-
-        x += self.shortcut(residual)
-
-        # ----------------------------------------------------
-        # NÃO-LINEARIDADE FINAL
-        # ----------------------------------------------------
-
-        x = F.relu(x)
-
-        return x
-
+from scipy.signal import butter, filtfilt
+from scipy.signal import savgol_filter
 
 # ============================================================
-# BRANCH DE ULTRASSOM
+# CONFIGURAÇÕES GERAIS
+# ============================================================
+
+# Frequência de amostragem
+FS = 20_000_000
+
+# Tempo de aquisição
+DURATION = 2e-3
+
+# Corrente AC injetada
+CURRENT = 1e-3
+
+# ============================================================
+# FAIXA MULTIFREQUENCIAL
 # ============================================================
 #
-# Entrada esperada:
+# Muito mais realista.
 #
-# [batch, canais, tempo]
-#
-# Canais:
-#
-# 0 -> RF bruto
-# 1 -> envelope
-# 2 -> espectro FFT
-# 3 -> derivada temporal
+# Frequências em escala log.
 #
 # ============================================================
 
-class UltrasoundBranch(nn.Module):
+FREQS = np.logspace(
 
-    def __init__(self):
-
-        super().__init__()
-
-        # ----------------------------------------------------
-        # EXTRAÇÃO DE FEATURES
-        # ----------------------------------------------------
-
-        self.features = nn.Sequential(
-
-            # ----------------------------------------------
-            # BLOCO 1
-            # ----------------------------------------------
-
-            ResidualBlock1D(
-                in_channels=4,
-                out_channels=32
-            ),
-
-            nn.MaxPool1d(2),
-
-            nn.Dropout(0.1),
-
-            # ----------------------------------------------
-            # BLOCO 2
-            # ----------------------------------------------
-
-            ResidualBlock1D(
-                32,
-                64
-            ),
-
-            nn.MaxPool1d(2),
-
-            nn.Dropout(0.15),
-
-            # ----------------------------------------------
-            # BLOCO 3
-            # ----------------------------------------------
-
-            ResidualBlock1D(
-                64,
-                128
-            ),
-
-            nn.MaxPool1d(2),
-
-            nn.Dropout(0.2)
-        )
-
-        # ----------------------------------------------------
-        # GLOBAL POOLING
-        # ----------------------------------------------------
-        #
-        # Reduz dimensão temporal
-        # sem perder informação estatística.
-        #
-        # ----------------------------------------------------
-
-        self.pool = nn.AdaptiveAvgPool1d(1)
-
-        # ----------------------------------------------------
-        # EMBEDDING FINAL
-        # ----------------------------------------------------
-
-        self.fc = nn.Sequential(
-
-            nn.Linear(
-                128,
-                128
-            ),
-
-            nn.ReLU(),
-
-            nn.Dropout(0.3)
-        )
-
-    def forward(self, x):
-
-        # x:
-        # [batch, 4, tempo]
-
-        x = self.features(x)
-
-        # Agora:
-        # [batch, 128, T]
-
-        x = self.pool(x)
-
-        # Agora:
-        # [batch, 128, 1]
-
-        x = x.squeeze(-1)
-
-        # Agora:
-        # [batch, 128]
-
-        x = self.fc(x)
-
-        return x
-
-
-# ============================================================
-# BRANCH DE BIOIMPEDÂNCIA
-# ============================================================
-#
-# Entrada:
-#
-# [batch, canais, frequências]
-#
-# Canais:
-#
-# 0 -> Re(Z)
-# 1 -> Im(Z)
-# 2 -> |Z|
-# 3 -> fase(Z)
-#
-# ============================================================
-
-class BioimpedanceBranch(nn.Module):
-
-    def __init__(self):
-
-        super().__init__()
-
-        self.features = nn.Sequential(
-
-            ResidualBlock1D(
-                4,
-                32
-            ),
-
-            nn.MaxPool1d(2),
-
-            nn.Dropout(0.1),
-
-            ResidualBlock1D(
-                32,
-                64
-            ),
-
-            nn.MaxPool1d(2),
-
-            nn.Dropout(0.15),
-
-            ResidualBlock1D(
-                64,
-                128
-            ),
-
-            nn.MaxPool1d(2),
-
-            nn.Dropout(0.2)
-        )
-
-        self.pool = nn.AdaptiveAvgPool1d(1)
-
-        self.fc = nn.Sequential(
-
-            nn.Linear(
-                128,
-                128
-            ),
-
-            nn.ReLU(),
-
-            nn.Dropout(0.3)
-        )
-
-    def forward(self, x):
-
-        x = self.features(x)
-
-        x = self.pool(x)
-
-        x = x.squeeze(-1)
-
-        x = self.fc(x)
-
-        return x
-
-
-# ============================================================
-# CNN MULTIMODAL
-# ============================================================
-#
-# FUSÃO:
-#
-# Features ultrassom
-#           +
-# Features bioimpedância
-#
-# ============================================================
-
-class CancerMultimodalCNN(nn.Module):
-
-    def __init__(self):
-
-        super().__init__()
-
-        # ----------------------------------------------------
-        # BRANCHES
-        # ----------------------------------------------------
-
-        self.ultra_branch = UltrasoundBranch()
-
-        self.bio_branch = BioimpedanceBranch()
-
-        # ----------------------------------------------------
-        # CLASSIFICADOR FINAL
-        # ----------------------------------------------------
-
-        self.classifier = nn.Sequential(
-
-            # ----------------------------------------------
-            # CONCATENAÇÃO:
-            #
-            # 128 + 128 = 256
-            # ----------------------------------------------
-
-            nn.Linear(
-                256,
-                128
-            ),
-
-            nn.BatchNorm1d(
-                128
-            ),
-
-            nn.ReLU(),
-
-            nn.Dropout(0.4),
-
-            # ----------------------------------------------
-            # CAMADA INTERMEDIÁRIA
-            # ----------------------------------------------
-
-            nn.Linear(
-                128,
-                64
-            ),
-
-            nn.ReLU(),
-
-            nn.Dropout(0.3),
-
-            # ----------------------------------------------
-            # SAÍDA
-            # ----------------------------------------------
-            #
-            # 1 neurônio:
-            #
-            # probabilidade de câncer
-            #
-            # 0 -> saudável
-            # 1 -> neoplásico
-            #
-            # ----------------------------------------------
-
-            nn.Linear(
-                64,
-                1
-            ),
-
-            nn.Sigmoid()
-        )
-
-    def forward(self, ultra, bio):
-
-        # ----------------------------------------------------
-        # EXTRAI FEATURES
-        # ----------------------------------------------------
-
-        ultra_features = self.ultra_branch(
-            ultra
-        )
-
-        bio_features = self.bio_branch(
-            bio
-        )
-
-        # ----------------------------------------------------
-        # CONCATENAÇÃO MULTIMODAL
-        # ----------------------------------------------------
-
-        x = torch.cat(
-
-            (
-                ultra_features,
-                bio_features
-            ),
-
-            dim=1
-        )
-
-        # ----------------------------------------------------
-        # CLASSIFICAÇÃO FINAL
-        # ----------------------------------------------------
-
-        output = self.classifier(x)
-
-        return output
-
-
-# ============================================================
-# INSTÂNCIA DO MODELO
-# ============================================================
-
-model = CancerMultimodalCNN()
-
-# ============================================================
-# LOSS FUNCTION
-# ============================================================
-#
-# Binary Cross Entropy:
-#
-# adequada para:
-#
-# • câncer vs saudável
-#
-# ============================================================
-
-criterion = nn.BCELoss()
-
-# ============================================================
-# OTIMIZADOR
-# ============================================================
-#
-# Adam:
-#
-# • convergência rápida
-# • estabilidade
-# • muito usado em IA biomédica
-#
-# ============================================================
-
-optimizer = torch.optim.Adam(
-
-    model.parameters(),
-
-    lr=1e-4,
-
-    weight_decay=1e-5
-)
-
-# ============================================================
-# EXEMPLO DE ENTRADA
-# ============================================================
-
-batch_size = 8
-
-# ------------------------------------------------------------
-# ULTRASSOM
-# ------------------------------------------------------------
-#
-# [batch, canais, tempo]
-#
-# 4 canais:
-#
-# • RF
-# • envelope
-# • FFT
-# • derivada temporal
-#
-# ------------------------------------------------------------
-
-ultra_input = torch.randn(
-    batch_size,
-    4,
-    4096
-)
-
-# ------------------------------------------------------------
-# BIOIMPEDÂNCIA
-# ------------------------------------------------------------
-#
-# [batch, canais, frequências]
-#
-# 4 canais:
-#
-# • Re(Z)
-# • Im(Z)
-# • |Z|
-# • fase
-#
-# ------------------------------------------------------------
-
-bio_input = torch.randn(
-    batch_size,
-    4,
+    np.log10(100e3),
+    np.log10(10e6),
     256
 )
 
 # ============================================================
-# FORWARD PASS
+# EIXO TEMPORAL
 # ============================================================
 
-output = model(
-    ultra_input,
-    bio_input
-)
+t = np.arange(
 
-# ============================================================
-# RESULTADO
-# ============================================================
-
-print("===================================")
-print("SAÍDA DA CNN")
-print("===================================")
-
-print(output.shape)
-
-print(output)
-
-# ============================================================
-# LOSS EXEMPLO
-# ============================================================
-
-target = torch.randint(
     0,
-    2,
-    (batch_size, 1)
-).float()
-
-loss = criterion(
-    output,
-    target
+    DURATION,
+    1/FS
 )
 
-print("\nLoss:", loss.item())
+# ============================================================
+# MODELO COLE-COLE
+# ============================================================
+#
+# Z(w)=Rinf + (R0-Rinf)/(1+(jwτ)^α)
+#
+# Modelo padrão ouro em bioimpedância.
+#
+# ============================================================
+
+def cole_cole_model(
+
+    freq,
+    R0,
+    Rinf,
+    tau,
+    alpha
+):
+
+    omega = 2 * np.pi * freq
+
+    jw_tau = 1j * omega * tau
+
+    Z = Rinf + (
+
+        (R0 - Rinf)
+
+        /
+
+        (1 + jw_tau**alpha)
+    )
+
+    return Z
 
 # ============================================================
-# BACKPROPAGATION
+# PROPRIEDADES DO TECIDO
 # ============================================================
 
-optimizer.zero_grad()
+def tissue_parameters(tumor=False):
 
-loss.backward()
+    """
+    Define propriedades elétricas.
+    """
 
-optimizer.step()
+    # --------------------------------------------------------
+    # TECIDO SAUDÁVEL
+    # --------------------------------------------------------
 
-print("\nBackpropagation executada.")
+    if not tumor:
+
+        params = {
+
+            "R0": 520,
+            "Rinf": 180,
+            "tau": 7e-7,
+            "alpha": 0.82
+        }
+
+    # --------------------------------------------------------
+    # TECIDO NEOPLÁSICO
+    # --------------------------------------------------------
+    #
+    # Alterações:
+    #
+    # • maior permissividade
+    # • alteração capacitiva
+    # • mudança dielétrica
+    # • dispersão diferente
+    #
+    # --------------------------------------------------------
+
+    else:
+
+        params = {
+
+            "R0": 780,
+            "Rinf": 250,
+            "tau": 1.4e-6,
+            "alpha": 0.67
+        }
+
+    return params
+
+# ============================================================
+# RUÍDO ELETRÔNICO
+# ============================================================
+
+def electronic_noise(signal):
+
+    """
+    Adiciona ruído instrumental.
+    """
+
+    thermal_noise = np.random.normal(
+
+        0,
+        0.002,
+        len(signal)
+    )
+
+    # --------------------------------------------------------
+    # DRIFT LENTO
+    # --------------------------------------------------------
+
+    drift = 0.001 * np.sin(
+
+        2*np.pi*5*t
+    )
+
+    return signal + thermal_noise + drift
+
+# ============================================================
+# FILTRO PASSA-BAIXA
+# ============================================================
+
+def lowpass(signal, cutoff=5e6):
+
+    nyquist = FS / 2
+
+    b, a = butter(
+
+        4,
+        cutoff / nyquist,
+        btype='low'
+    )
+
+    return filtfilt(b, a, signal)
+
+# ============================================================
+# GERA RESPOSTA ELÉTRICA
+# ============================================================
+
+def generate_impedance_signal(
+
+    freq,
+    tumor=False
+):
+
+    # --------------------------------------------------------
+    # PARÂMETROS DO TECIDO
+    # --------------------------------------------------------
+
+    p = tissue_parameters(
+        tumor=tumor
+    )
+
+    # --------------------------------------------------------
+    # IMPEDÂNCIA COMPLEXA
+    # --------------------------------------------------------
+
+    Z = cole_cole_model(
+
+        freq,
+
+        p["R0"],
+        p["Rinf"],
+        p["tau"],
+        p["alpha"]
+    )
+
+    # --------------------------------------------------------
+    # MÓDULO E FASE
+    # --------------------------------------------------------
+
+    magnitude = np.abs(Z)
+
+    phase = np.angle(Z)
+
+    # --------------------------------------------------------
+    # TENSÃO MEDIDA
+    # --------------------------------------------------------
+
+    voltage = (
+
+        magnitude
+        *
+        CURRENT
+        *
+        np.sin(
+            2*np.pi*freq*t + phase
+        )
+    )
+
+    # --------------------------------------------------------
+    # RUÍDO
+    # --------------------------------------------------------
+
+    voltage = electronic_noise(
+        voltage
+    )
+
+    # --------------------------------------------------------
+    # FILTRAGEM
+    # --------------------------------------------------------
+
+    voltage = lowpass(
+        voltage
+    )
+
+    return {
+
+        "signal": voltage,
+
+        "Z": Z,
+
+        "magnitude": magnitude,
+
+        "phase": phase,
+
+        "real": np.real(Z),
+
+        "imag": np.imag(Z)
+    }
+
+# ============================================================
+# NORMALIZAÇÃO ROBUSTA
+# ============================================================
+
+def robust_normalize(x):
+
+    median = np.median(x)
+
+    iqr = np.percentile(x, 75) - np.percentile(x, 25)
+
+    return (x - median) / (iqr + 1e-8)
+
+# ============================================================
+# SUAVIZAÇÃO
+# ============================================================
+
+def smooth_signal(signal):
+
+    return savgol_filter(
+
+        signal,
+        31,
+        3
+    )
+
+# ============================================================
+# DATASET
+# ============================================================
+
+dataset = []
+
+labels = []
+
+# ============================================================
+# GERAÇÃO MONTE CARLO
+# ============================================================
+#
+# Varia:
+#
+# • ruído
+# • parâmetros elétricos
+# • resposta dielétrica
+#
+# ============================================================
+
+N_SAMPLES = 500
+
+for tumor in [False, True]:
+
+    for sample in range(N_SAMPLES):
+
+        # ----------------------------------------------------
+        # ARRAYS MULTIFREQUENCIAIS
+        # ----------------------------------------------------
+
+        real_part = []
+
+        imag_part = []
+
+        magnitude_part = []
+
+        phase_part = []
+
+        # ----------------------------------------------------
+        # VARREDURA DE FREQUÊNCIA
+        # ----------------------------------------------------
+
+        for freq in FREQS:
+
+            data = generate_impedance_signal(
+
+                freq,
+                tumor=tumor
+            )
+
+            # ----------------------------------------------
+            # ADICIONA VARIAÇÃO BIOLÓGICA
+            # ----------------------------------------------
+
+            variation = np.random.normal(
+                1,
+                0.03
+            )
+
+            real_part.append(
+                data["real"] * variation
+            )
+
+            imag_part.append(
+                data["imag"] * variation
+            )
+
+            magnitude_part.append(
+                data["magnitude"] * variation
+            )
+
+            phase_part.append(
+                data["phase"] * variation
+            )
+
+        # ----------------------------------------------------
+        # CONVERTE
+        # ----------------------------------------------------
+
+        real_part = np.array(real_part)
+
+        imag_part = np.array(imag_part)
+
+        magnitude_part = np.array(magnitude_part)
+
+        phase_part = np.array(phase_part)
+
+        # ----------------------------------------------------
+        # NORMALIZAÇÃO
+        # ----------------------------------------------------
+
+        real_part = robust_normalize(
+            real_part
+        )
+
+        imag_part = robust_normalize(
+            imag_part
+        )
+
+        magnitude_part = robust_normalize(
+            magnitude_part
+        )
+
+        phase_part = robust_normalize(
+            phase_part
+        )
+
+        # ----------------------------------------------------
+        # EMPILHA CANAIS
+        # ----------------------------------------------------
+        #
+        # CNN INPUT:
+        #
+        # canal 0 -> Re(Z)
+        # canal 1 -> Im(Z)
+        # canal 2 -> |Z|
+        # canal 3 -> fase
+        #
+        # shape:
+        #
+        # [4, Nfreq]
+        #
+        # ----------------------------------------------------
+
+        sample_tensor = np.stack([
+
+            real_part,
+            imag_part,
+            magnitude_part,
+            phase_part
+
+        ])
+
+        dataset.append(
+            sample_tensor
+        )
+
+        labels.append(
+            int(tumor)
+        )
+
+# ============================================================
+# CONVERSÃO FINAL
+# ============================================================
+
+X_bio = np.array(dataset)
+
+y_bio = np.array(labels)
+
+# ============================================================
+# SHAPES
+# ============================================================
+
+print("===================================")
+print("BIOIMPEDÂNCIA DATASET")
+print("===================================")
+
+print("X shape:", X_bio.shape)
+print("y shape:", y_bio.shape)
+
+# Esperado:
+#
+# X:
+# [amostras, canais, frequências]
+#
+# Ex:
+# [1000, 4, 256]
+
+# ============================================================
+# VISUALIZAÇÃO
+# ============================================================
+
+healthy = X_bio[0]
+
+tumor = X_bio[-1]
+
+# ============================================================
+# PLOT MAGNITUDE
+# ============================================================
+
+plt.figure(figsize=(12,5))
+
+plt.semilogx(
+
+    FREQS,
+
+    healthy[2],
+
+    label="Saudável"
+)
+
+plt.semilogx(
+
+    FREQS,
+
+    tumor[2],
+
+    label="Tumor"
+)
+
+plt.xlabel("Frequência (Hz)")
+
+plt.ylabel("|Z| normalizado")
+
+plt.title("Magnitude da Bioimpedância")
+
+plt.grid()
+
+plt.legend()
+
+plt.show()
+
+# ============================================================
+# PLOT FASE
+# ============================================================
+
+plt.figure(figsize=(12,5))
+
+plt.semilogx(
+
+    FREQS,
+
+    healthy[3],
+
+    label="Saudável"
+)
+
+plt.semilogx(
+
+    FREQS,
+
+    tumor[3],
+
+    label="Tumor"
+)
+
+plt.xlabel("Frequência (Hz)")
+
+plt.ylabel("Fase normalizada")
+
+plt.title("Fase da Bioimpedância")
+
+plt.grid()
+
+plt.legend()
+
+plt.show()
+
+# ============================================================
+# SALVA DATASET
+# ============================================================
+
+np.save(
+
+    "bioimpedance_X.npy",
+
+    X_bio
+)
+
+np.save(
+
+    "bioimpedance_y.npy",
+
+    y_bio
+)
+
+print("\nDataset salvo.")
